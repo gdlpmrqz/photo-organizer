@@ -13,6 +13,10 @@ rem  (worked out from the GPS location saved in the photo).
 rem  A page called "Start Here.html" is also made in the main folder,
 rem  with a button for each year and a random photo from this month.
 rem  Folders left empty after the move are removed.
+rem  iPhone photos (HEIC) are converted to JPG so they show in the pages.
+rem  Photos already in Year\Month folders are left alone, so it is safe to
+rem  add new photos to the folder and run this again.
+rem  The original HEIC files are kept in the "Originals Backup" folder.
 rem  A log of every move is saved so it can be undone.
 rem ------------------------------------------------------------------
 set "SELF=%~f0"
@@ -24,12 +28,22 @@ exit /b
 #PS_START
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
 $inv  = [Globalization.CultureInfo]::InvariantCulture
 $root = (Resolve-Path -LiteralPath $env:TARGET_DIR).ProviderPath.TrimEnd('\')
 
 $imageExt = '.jpg','.jpeg','.png','.gif','.bmp','.tif','.tiff','.webp','.heic','.heif','.dng','.cr2','.nef','.arw'
 $videoExt = '.mp4','.mov','.avi','.mkv','.m4v','.3gp','.wmv'
 $mediaExt = $imageExt + $videoExt
+$heicExt  = '.heic','.heif'
+
+# ---- Settings ----
+$backupName = 'Originals Backup'    # folder (inside the photo folder) that keeps the original files
+$BackupEveryOriginal = $false       # $false = back up only the HEIC originals that get converted
+                                    # $true  = also keep a copy of every other photo (uses extra disk space)
+$ConvertOldHeic = $false            # $false = photos already in Year\Month folders are never touched
+                                    # $true  = also convert HEIC photos already in Year\Month folders (one-time fix)
 $exifExt  = '.jpg','.jpeg','.tif','.tiff','.png'
 
 # ---- Built-in place list (name|latitude|longitude) so no internet is needed ----
@@ -433,6 +447,118 @@ function Get-PhotoMeta([string]$path) {
     return [pscustomobject]@{ Date = $date; Lat = $lat; Lon = $lon; Source = $source }
 }
 
+# Pick a file name that does not exist yet in a folder (creates the folder if needed)
+function New-UniquePath([string]$dir, [string]$fileName) {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    $p = Join-Path $dir $fileName
+    $c = 1
+    $b = [IO.Path]::GetFileNameWithoutExtension($fileName)
+    $e = [IO.Path]::GetExtension($fileName)
+    while (Test-Path -LiteralPath $p) {
+        $p = Join-Path $dir ('{0} ({1}){2}' -f $b, $c, $e)
+        $c++
+    }
+    return $p
+}
+
+# Convert rational numbers returned by Windows imaging (low 32 bits = numerator, high 32 bits = denominator)
+function Convert-WicDms($arr) {
+    $list = @($arr)
+    if ($list.Count -lt 3) { return $null }
+    $vals = @()
+    for ($k = 0; $k -lt 3; $k++) {
+        $r = [uint64]$list[$k]
+        $num = [double]($r -band [uint64]4294967295)
+        $den = [double]($r -shr 32)
+        if ($den -eq 0) { $vals += 0.0 } else { $vals += ($num / $den) }
+    }
+    return ($vals[0] + $vals[1] / 60 + $vals[2] / 3600)
+}
+
+# Read date taken and GPS from a HEIC file through Windows imaging (needs the HEIF extension installed)
+function Get-HeicMeta([string]$path) {
+    $res = [pscustomobject]@{ Date = $null; Lat = $null; Lon = $null }
+    $fs = $null
+    try {
+        $fs  = [IO.File]::OpenRead($path)
+        $dec = [Windows.Media.Imaging.BitmapDecoder]::Create($fs, [Windows.Media.Imaging.BitmapCreateOptions]::DelayCreation, [Windows.Media.Imaging.BitmapCacheOption]::None)
+        $md  = $dec.Frames[0].Metadata
+        foreach ($pre in '/ifd/exif', '/app1/ifd/exif') {
+            foreach ($tag in 36867, 36868) {
+                if (-not $res.Date) {
+                    $v = $null
+                    try { $v = $md.GetQuery(('{0}/{{ushort={1}}}' -f $pre, $tag)) } catch { }
+                    if ($v) {
+                        $d = [datetime]::MinValue
+                        if ([datetime]::TryParseExact(([string]$v).Trim(), 'yyyy:MM:dd HH:mm:ss', $inv, [Globalization.DateTimeStyles]::None, [ref]$d) -and $d.Year -ge 1971) { $res.Date = $d }
+                    }
+                }
+            }
+        }
+        foreach ($pre in '/ifd/gps', '/app1/ifd/gps') {
+            if ($null -eq $res.Lat) {
+                $latRef = $null; $lonRef = $null; $latA = $null; $lonA = $null
+                try { $latRef = [string]$md.GetQuery(('{0}/{{ushort={1}}}' -f $pre, 1)) } catch { }
+                try { $latA   = $md.GetQuery(('{0}/{{ushort={1}}}' -f $pre, 2)) } catch { }
+                try { $lonRef = [string]$md.GetQuery(('{0}/{{ushort={1}}}' -f $pre, 3)) } catch { }
+                try { $lonA   = $md.GetQuery(('{0}/{{ushort={1}}}' -f $pre, 4)) } catch { }
+                if ($latA -and $lonA) {
+                    $latV = Convert-WicDms $latA
+                    $lonV = Convert-WicDms $lonA
+                    if (($null -ne $latV) -and ($null -ne $lonV)) {
+                        if ($latRef -like 'S*') { $latV = -$latV }
+                        if ($lonRef -like 'W*') { $lonV = -$lonV }
+                        if ((($latV -ne 0) -or ($lonV -ne 0)) -and ([math]::Abs($latV) -le 90) -and ([math]::Abs($lonV) -le 180)) {
+                            $res.Lat = $latV; $res.Lon = $lonV
+                        }
+                    }
+                }
+            }
+        }
+    } catch { } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+    return $res
+}
+
+# Convert a HEIC/HEIF photo to a JPG (keeps the date and GPS information when Windows allows it)
+function Convert-HeicToJpg([string]$src, [string]$dst) {
+    $in = $null
+    try {
+        $in  = [IO.File]::OpenRead($src)
+        $dec = [Windows.Media.Imaging.BitmapDecoder]::Create($in, [Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+        $frame = $dec.Frames[0]
+        $saved = $false
+        foreach ($withMeta in $true, $false) {
+            if ($saved) { break }
+            $out = $null
+            try {
+                $enc = New-Object Windows.Media.Imaging.JpegBitmapEncoder
+                $enc.QualityLevel = 92
+                if ($withMeta) {
+                    $md = $null; $th = $null; $cc = $null
+                    try { $md = $frame.Metadata } catch { }
+                    try { $th = $frame.Thumbnail } catch { }
+                    try { $cc = $frame.ColorContexts } catch { }
+                    $f2 = [Windows.Media.Imaging.BitmapFrame]::Create($frame, $th, $md, $cc)
+                } else {
+                    $f2 = [Windows.Media.Imaging.BitmapFrame]::Create($frame)
+                }
+                $enc.Frames.Add($f2)
+                $out = [IO.File]::Create($dst)
+                $enc.Save($out)
+                $saved = $true
+            } catch {
+                if (-not $withMeta) { throw }
+            } finally {
+                if ($out) { $out.Dispose() }
+            }
+        }
+    } finally {
+        if ($in) { $in.Dispose() }
+    }
+}
+
 # ---- Large-print page for one year (no internet, no outside files) ----
 $template = @'
 <!doctype html>
@@ -480,6 +606,7 @@ $template = @'
 var DATA = __DATA__;
 var MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 var VIDEO = /\.(mp4|mov|avi|mkv|m4v|3gp|wmv)$/i;
+var NOSHOW = /\.(heic|heif|dng|cr2|nef|arw|tif|tiff)$/i;
 function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
 function url(f) { return f.split('/').map(encodeURIComponent).join('/'); }
 
@@ -517,7 +644,7 @@ monthOrder.forEach(function (mo) {
             ' <span class="count">(' + list.length + (list.length === 1 ? ' photo' : ' photos') + ')</span></div><div class="grid">';
     list.forEach(function (x) {
       var day = parseInt(x.d.substring(8, 10), 10);
-      var pic = VIDEO.test(x.f) ? '<div class="nopic">Video</div>' : '<img loading="lazy" src="' + esc(url(x.f)) + '" alt="" onerror="this.outerHTML=\'<div class=nopic>Photo</div>\'">';
+      var pic = VIDEO.test(x.f) ? '<div class="nopic">Video</div>' : NOSHOW.test(x.f) ? '<div class="nopic">Photo (click to open)</div>' : '<img loading="lazy" src="' + esc(url(x.f)) + '" alt="" onerror="this.outerHTML=\'<div class=nopic>Photo</div>\'">';
       html += '<a class="tile" href="' + esc(url(x.f)) + '">' + pic + '<span>' + MONTHS[mo - 1] + ' ' + day + '</span></a>';
     });
     html += '</div>';
@@ -553,6 +680,8 @@ $indexTemplate = @'
   #random img { display: block; max-width: 100%; max-height: 70vh; border: 4px solid #1b3a5c; border-radius: 12px; background: #ddd; }
   #rcap { font-size: 38px; font-weight: 700; margin: 16px 0; }
   #rbtn { font-family: inherit; font-size: 32px; padding: 14px 28px; color: #fff; background: #1b3a5c; border: 0; border-radius: 12px; cursor: pointer; }
+  .backup { font-size: 30px; margin-top: 40px; }
+  .backup a { color: #1b3a5c; }
   #rbtn:hover, #rbtn:focus { background: #0f2540; outline: 5px solid #ffbf00; }
 </style>
 </head>
@@ -569,6 +698,7 @@ __LINKS__
   <div id="rcap"></div>
   <button id="rbtn" type="button">Show another photo</button>
 </section>
+<p class="backup">__BACKUP__</p>
 </main>
 <script>
 var PHOTOS = __DATA__;
@@ -604,17 +734,21 @@ Write-Host ''
 Write-Host "Folder: $root"
 Write-Host 'Scanning for photos and videos...'
 $files = @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object {
-    ($mediaExt -contains $_.Extension.ToLower()) -and
-    ($_.FullName.Substring($root.Length + 1) -notmatch '^\d{4}\\\d{2}-[A-Za-z]+\\')
+    $rel = $_.FullName.Substring($root.Length + 1)
+    $ext = $_.Extension.ToLower()
+    ($mediaExt -contains $ext) -and
+    ($rel -notlike ($backupName + '\*')) -and
+    (($rel -notmatch '^\d{4}\\\d{2}-[A-Za-z]+\\') -or ($ConvertOldHeic -and ($heicExt -contains $ext)))
 })
 Write-Host ('Found {0} file(s) to organize.' -f $files.Count)
 
 $cache = @{}
 $log = New-Object System.Collections.ArrayList
 $moved = 0; $failed = 0; $fromExif = 0; $fromFile = 0
+$converted = 0; $convFail = 0; $codecMissing = $false
 
 if ($files.Count -gt 0) {
-    $ans = Read-Host 'Move them into Year\Month folders? (Y/N)'
+    $ans = Read-Host 'Move them into Year\Month folders (iPhone HEIC photos will be converted to JPG)? (Y/N)'
     if ($ans -notmatch '^[Yy]') { Write-Host 'Cancelled. Nothing was changed.'; return }
 
     $n = 0
@@ -622,18 +756,60 @@ if ($files.Count -gt 0) {
         $n++
         if ($n % 25 -eq 0) { Write-Host ('  {0} / {1}' -f $n, $files.Count) }
         try {
+            $ext = $f.Extension.ToLower()
+
+            # --- iPhone HEIC photos: convert to JPG, keep the original in the backup folder ---
+            if ((-not $codecMissing) -and ($heicExt -contains $ext)) {
+                $tmp = Join-Path $env:TEMP ([guid]::NewGuid().ToString('N') + '.jpg')
+                $ok = $false
+                try {
+                    Convert-HeicToJpg $f.FullName $tmp
+                    $ok = (Test-Path -LiteralPath $tmp) -and ((Get-Item -LiteralPath $tmp).Length -gt 0)
+                } catch { $ok = $false }
+                if ($ok) {
+                    $m = Get-PhotoMeta $tmp
+                    if (($m.Source -ne 'EXIF') -or ($null -eq $m.Lat)) {
+                        $h = Get-HeicMeta $f.FullName
+                        $newDate = $m.Date; $newSrc = $m.Source; $newLat = $m.Lat; $newLon = $m.Lon
+                        if ($m.Source -ne 'EXIF') {
+                            if ($h.Date) { $newDate = $h.Date; $newSrc = 'EXIF' }
+                            else { $o = Get-PhotoMeta $f.FullName; $newDate = $o.Date; $newSrc = 'file date' }
+                        }
+                        if (($null -eq $newLat) -and ($null -ne $h.Lat)) { $newLat = $h.Lat; $newLon = $h.Lon }
+                        $m = [pscustomobject]@{ Date = $newDate; Lat = $newLat; Lon = $newLon; Source = $newSrc }
+                    }
+                    $sub = $m.Date.ToString('yyyy', $inv) + '\' + $m.Date.ToString('MM-MMMM', $inv)
+                    $destJpg = New-UniquePath (Join-Path $root $sub) ([IO.Path]::GetFileNameWithoutExtension($f.Name) + '.jpg')
+                    [IO.File]::Move($tmp, $destJpg)
+                    try { (Get-Item -LiteralPath $destJpg).LastWriteTime = $m.Date } catch { }
+                    $backupDest = New-UniquePath (Join-Path (Join-Path $root $backupName) $sub) $f.Name
+                    [IO.File]::Move($f.FullName, $backupDest)
+                    [void]$log.Add([pscustomobject]@{ From = $f.FullName; To = $destJpg; Backup = $backupDest })
+                    $cache[$destJpg] = $m
+                    $moved++; $converted++
+                    if ($m.Source -eq 'EXIF') { $fromExif++ } else { $fromFile++ }
+                    continue
+                }
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+                $convFail++
+                if (($convFail -ge 3) -and ($converted -eq 0)) { $codecMissing = $true }
+            }
+
+            # --- everything else (or HEIC that could not be converted): move into Year\Month ---
             $m = Get-PhotoMeta $f.FullName
-            $destDir = Join-Path $root ($m.Date.ToString('yyyy', $inv) + '\' + $m.Date.ToString('MM-MMMM', $inv))
+            $sub = $m.Date.ToString('yyyy', $inv) + '\' + $m.Date.ToString('MM-MMMM', $inv)
+            $destDir = Join-Path $root $sub
             if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir | Out-Null }
             $dest = Join-Path $destDir $f.Name
             if ($dest -ne $f.FullName) {
-                $c = 1
-                while (Test-Path -LiteralPath $dest) {
-                    $dest = Join-Path $destDir ('{0} ({1}){2}' -f [IO.Path]::GetFileNameWithoutExtension($f.Name), $c, $f.Extension)
-                    $c++
+                $backupCopy = ''
+                if ($BackupEveryOriginal) {
+                    $backupCopy = New-UniquePath (Join-Path (Join-Path $root $backupName) $sub) $f.Name
+                    [IO.File]::Copy($f.FullName, $backupCopy)
                 }
+                $dest = New-UniquePath $destDir $f.Name
                 [IO.File]::Move($f.FullName, $dest)
-                [void]$log.Add([pscustomobject]@{ From = $f.FullName; To = $dest })
+                [void]$log.Add([pscustomobject]@{ From = $f.FullName; To = $dest; Backup = $backupCopy })
                 $cache[$dest] = $m
                 $moved++
                 if ($m.Source -eq 'EXIF') { $fromExif++ } else { $fromFile++ }
@@ -705,10 +881,24 @@ foreach ($yd in $yearDirs) {
 }
 if ($links) {
     $indexJson = (ConvertTo-Json -InputObject @($indexItems) -Compress) -replace '</', '<\/'
-    $indexHtml = $indexTemplate.Replace('__LINKS__', $links).Replace('__DATA__', $indexJson)
+    $backupLink = ''
+    if (Test-Path -LiteralPath (Join-Path $root $backupName)) {
+        $backupLink = '<a href="' + [uri]::EscapeDataString($backupName) + '/">Look at the original photos (backup)</a>'
+    }
+    $indexHtml = $indexTemplate.Replace('__LINKS__', $links).Replace('__DATA__', $indexJson).Replace('__BACKUP__', $backupLink)
     [IO.File]::WriteAllText((Join-Path $root 'Start Here.html'), $indexHtml, $utf8)
     Write-Host 'Made "Start Here.html" in the main folder.'
 }
 
 Write-Host ''
 Write-Host ('Done. Moved {0} file(s) ({1} by date taken, {2} by created date). Failed: {3}.' -f $moved, $fromExif, $fromFile, $failed)
+if ($converted -gt 0) {
+    Write-Host ('Converted {0} iPhone (HEIC) photo(s) to JPG. The originals are in the "{1}" folder.' -f $converted, $backupName)
+}
+if ($convFail -gt 0) {
+    Write-Host ''
+    Write-Host ('{0} iPhone (HEIC) photo(s) could not be converted and were left as they are.' -f $convFail)
+    Write-Host 'Windows needs two free add-ons from the Microsoft Store to read them:'
+    Write-Host '   "HEIF Image Extensions" and "HEVC Video Extensions"'
+    Write-Host 'Install them on a computer with internet, then run this file again to convert them.'
+}
