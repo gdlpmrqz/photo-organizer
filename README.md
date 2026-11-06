@@ -39,3 +39,7 @@ Places not in the list are shown as the nearest listed place, so small towns may
 - Only HEIC originals that were converted go to `Originals Backup`. To also keep a copy of every other photo, change `$BackupEveryOriginal = $false` to `$true` near the top of the script (uses extra disk space).
 - Raw (dng, cr2, nef, arw) and tiff photos show as a "Photo (click to open)" tile because web browsers cannot display them.
 - Re-running is safe: files already in `Year\Month` folders are left alone, and the pages are rebuilt to include new photos.
+
+## Uploading to GitHub
+
+Double-click `git-sync.bat` in this folder for a simple menu: save and upload your changes, download the latest, see what changed, or view recent history. It asks for a short description of your changes, pulls first so GitHub's changes are merged in, and walks you through a conflict if the same file changed in both places. It needs Git for Windows and an internet connection.
